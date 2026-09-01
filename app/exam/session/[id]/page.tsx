@@ -1,3 +1,4 @@
+/* PHASE10E2_IPAD_RECORDER_FIX */
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -302,7 +303,7 @@ export default function ExamSessionPage() {
       const blob = await new Promise<Blob>((resolve, reject) => {
         const timeout = window.setTimeout(
           () => reject(new Error("停止錄音逾時。")),
-          10000
+          60000
         );
 
         recorder.addEventListener(

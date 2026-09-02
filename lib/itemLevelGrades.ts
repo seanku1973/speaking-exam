@@ -1,4 +1,4 @@
-/* PHASE11_ITEM_LEVEL_GRADES */
+/* PHASE11C_ITEM_LEVEL_GRADES */
 export type ItemLevelGrade = {
   key: string;
   label: string;
@@ -25,8 +25,8 @@ Assign an integer performance level from 0 to 5 for each speaking item.
 Task rules:
 - Part 1 Reading Aloud: ONE integrated 0-5 grade for the whole reading.
 - Part 2: Q1-Q10 EACH receive one separate integer 0-5 grade.
-- Part 3 Picture Description: ONE integrated 0-5 grade for the entire 90-second description. Do NOT split into four guide-question grades.
-- These item grades are diagnostic and remain separate from the existing 100-point Content/Organization/Grammar/Vocabulary/Fluency score.
+- Part 3 Picture Description: ONE integrated 0-5 grade for the entire 90-second description.
+- These item grades remain separate from the existing 100-point score.
 `;
 
 export function normalizeItemLevelGrades(value: any): ItemLevelGradeBundle | null {
@@ -57,16 +57,14 @@ export function normalizeItemLevelGrades(value: any): ItemLevelGradeBundle | nul
 
   const part1 = norm(value.part1, "part1", "第一部分：朗讀");
   const part3 = norm(value.part3, "part3", "第三部分：看圖敘述");
-
   const rawPart2 = Array.isArray(value.part2) ? value.part2 : [];
-  const part2 = [];
+  const part2: ItemLevelGrade[] = [];
 
   for (let i = 1; i <= 10; i++) {
     const key = `q${i}`;
     const candidate =
       rawPart2.find((x: any) => String(x?.key || "").toLowerCase() === key) ??
       rawPart2[i - 1];
-
     const item = norm(candidate, key, `Q${i}`);
     if (item) part2.push(item);
   }

@@ -47,3 +47,4 @@ node_modules
 *.phase10e2-backup
 *.phase11-backup
 *.phase11a-before-fix
+*.phase11c-backup

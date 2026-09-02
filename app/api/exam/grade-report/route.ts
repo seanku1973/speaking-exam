@@ -1,12 +1,15 @@
+/* PHASE11_ITEM_LEVEL_GRADES */
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import {
+
   extractResponseText,
   readOpenAIError,
   windowText,
   type Segment,
 } from "@/lib/ai-audio";
+import { ITEM_LEVEL_RUBRIC, normalizeItemLevelGrades } from "@/lib/itemLevelGrades";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -394,7 +397,158 @@ ${transcript}
     .eq("id", sessionId)
     .eq("student_id", auth.user.id);
 
-  return NextResponse.json({
+  
+  /* PHASE11_ITEM_LEVEL_GRADES */
+  try {
+    const phase11SessionId = sessionId;
+
+    const { data: phase11Existing } = await supabase
+      .from("exam_results")
+      .select("transcript,grading_json,item_feedback")
+      .eq("session_id", phase11SessionId)
+      .maybeSingle();
+
+    const phase11Transcript =
+      typeof phase11Existing?.transcript === "string"
+        ? phase11Existing.transcript
+        : "";
+
+    const phase11ExistingJson =
+      phase11Existing?.grading_json && typeof phase11Existing.grading_json === "object"
+        ? phase11Existing.grading_json
+        : {};
+
+    const phase11ApiKey = process.env.OPENAI_API_KEY;
+
+    if (phase11ApiKey && phase11Transcript) {
+      const phase11Response = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${phase11ApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: process.env.OPENAI_GRADING_MODEL || "gpt-5.6-luna",
+          input: [
+            {
+              role: "system",
+              content:
+                "You are grading an English speaking test. " +
+                ITEM_LEVEL_RUBRIC +
+                "\nReturn only JSON that matches the schema. " +
+                "Use integer levels 0-5 only. " +
+                "Do not infer unsupported pronunciation details."
+            },
+            {
+              role: "user",
+              content:
+                "Assign the 12 item-level grades for this completed speaking test.\n\n" +
+                "TRANSCRIPT:\n" +
+                phase11Transcript +
+                "\n\nEXISTING ITEM FEEDBACK:\n" +
+                JSON.stringify(phase11Existing?.item_feedback ?? {}) +
+                "\n\nEXISTING GRADING JSON:\n" +
+                JSON.stringify(phase11ExistingJson)
+            }
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "speaking_item_level_grades",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                required: ["part1", "part2", "part3"],
+                properties: {
+                  part1: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["key", "label", "level", "rationale"],
+                    properties: {
+                      key: { type: "string", const: "part1" },
+                      label: { type: "string" },
+                      level: { type: "integer", minimum: 0, maximum: 5 },
+                      rationale: { type: "string" }
+                    }
+                  },
+                  part2: {
+                    type: "array",
+                    minItems: 10,
+                    maxItems: 10,
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["key", "label", "level", "rationale"],
+                      properties: {
+                        key: { type: "string" },
+                        label: { type: "string" },
+                        level: { type: "integer", minimum: 0, maximum: 5 },
+                        rationale: { type: "string" }
+                      }
+                    }
+                  },
+                  part3: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["key", "label", "level", "rationale"],
+                    properties: {
+                      key: { type: "string", const: "part3" },
+                      label: { type: "string" },
+                      level: { type: "integer", minimum: 0, maximum: 5 },
+                      rationale: { type: "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        })
+      });
+
+      if (phase11Response.ok) {
+        const phase11Raw = await phase11Response.json();
+
+        const phase11Text =
+          phase11Raw?.output_text ||
+          phase11Raw?.output
+            ?.flatMap((o: any) => o?.content || [])
+            ?.map((c: any) => c?.text || "")
+            ?.join("") ||
+          "";
+
+        if (phase11Text) {
+          const phase11Parsed = normalizeItemLevelGrades(
+            JSON.parse(phase11Text)
+          );
+
+          if (phase11Parsed) {
+            await supabase
+              .from("exam_results")
+              .update({
+                grading_json: {
+                  ...phase11ExistingJson,
+                  item_level_grades: phase11Parsed,
+                  item_level_grades_version: "phase11-v1"
+                }
+              })
+              .eq("session_id", phase11SessionId);
+          }
+        }
+      } else {
+        console.error(
+          "Phase 11 item-level grading failed:",
+          phase11Response.status,
+          await phase11Response.text()
+        );
+      }
+    }
+  } catch (phase11Error) {
+    // Never break the existing 100-point result.
+    console.error("Phase 11 item-level grading error:", phase11Error);
+  }
+
+return NextResponse.json({
     ok: true,
     result: { total_score: total, passed },
   });

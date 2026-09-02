@@ -45,3 +45,5 @@ next-env.d.ts
 node_modules
 .next
 *.phase10e2-backup
+*.phase11-backup
+*.phase11a-before-fix

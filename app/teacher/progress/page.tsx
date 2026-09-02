@@ -1,9 +1,11 @@
+/* PHASE12_CLASS_SCORE_MATRIX */
 /* PHASE11C_DISPLAY_AND_BACKFILL */
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import styles from "./page.module.css";
+import ExamMatrix from "./ExamMatrix";
 
 type Row = {
   session_id: string;
@@ -250,6 +252,7 @@ export default function TeacherProgressPage() {
   const [activeQuestion, setActiveQuestion] = useState(1);
   const [itemGradeLoading, setItemGradeLoading] = useState(false);
   const [itemGradeMessage, setItemGradeMessage] = useState("");
+  const [matrixOpen, setMatrixOpen] = useState(false);
 
   async function loadDashboard() {
     try {
@@ -599,6 +602,13 @@ export default function TeacherProgressPage() {
             <button
               type="button"
               className={styles.secondaryButton}
+              onClick={() => setMatrixOpen(true)}
+            >
+              全班答題表
+            </button>
+            <button
+              type="button"
+              className={styles.secondaryButton}
               onClick={loadDashboard}
             >
               重新整理
@@ -863,6 +873,15 @@ export default function TeacherProgressPage() {
           </div>
         </section>
       </div>
+
+      <ExamMatrix
+        open={matrixOpen}
+        onClose={() => setMatrixOpen(false)}
+        onOpenReport={(sessionId) => {
+          setMatrixOpen(false);
+          openDetail(sessionId);
+        }}
+      />
 
       {selectedId && (
         <div

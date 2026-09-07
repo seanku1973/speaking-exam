@@ -1,8 +1,10 @@
+/* PHASE13A_DIRECT_SUPABASE_UPLOAD */
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import styles from "./page.module.css";
+import { supabase } from "@/lib/supabase";
 
 type ExamSet = {
   id: string;
@@ -61,6 +63,7 @@ export default function TeacherExamsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
@@ -210,37 +213,147 @@ export default function TeacherExamsPage() {
       return;
     }
 
+    async function requestSignedUpload(
+      kind: "audio" | "image",
+      file: File
+    ) {
+      const response = await fetch(`/api/teacher/exams/${exam.id}/assets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "sign",
+          kind,
+          file: {
+            name: file.name,
+            type: file.type,
+            size: file.size,
+          },
+        }),
+      });
+
+      const raw = await response.text();
+      let body: any = {};
+
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(
+          `無法取得 ${kind === "audio" ? "MP3" : "圖片"} 上傳授權（HTTP ${response.status}）。`
+        );
+      }
+
+      if (!response.ok || !body.ok) {
+        throw new Error(
+          body.message ||
+            `無法取得 ${kind === "audio" ? "MP3" : "圖片"} 上傳授權。`
+        );
+      }
+
+      return body.upload as {
+        bucket: string;
+        path: string;
+        token: string;
+      };
+    }
+
+    async function finalizeUpload(
+      kind: "audio" | "image",
+      path: string
+    ) {
+      const response = await fetch(`/api/teacher/exams/${exam.id}/assets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "finalize",
+          kind,
+          path,
+        }),
+      });
+
+      const raw = await response.text();
+      let body: any = {};
+
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(
+          `檔案已傳送，但伺服器無法完成題組更新（HTTP ${response.status}）。`
+        );
+      }
+
+      if (!response.ok || !body.ok) {
+        throw new Error(body.message || "題組資料更新失敗。");
+      }
+
+      return body.exam_set as ExamSet;
+    }
+
+    async function uploadOne(
+      kind: "audio" | "image",
+      file: File
+    ) {
+      const label = kind === "audio" ? "MP3" : "圖片";
+
+      setUploadStatus(`正在取得 ${label} 安全上傳授權...`);
+      const signed = await requestSignedUpload(kind, file);
+
+      setUploadStatus(
+        `正在直接上傳 ${label} 到 Supabase Storage，請勿關閉頁面...`
+      );
+
+      const { error: uploadError } = await supabase.storage
+        .from(signed.bucket)
+        .uploadToSignedUrl(signed.path, signed.token, file, {
+          contentType: file.type || undefined,
+        });
+
+      if (uploadError) {
+        throw new Error(`${label} 上傳失敗：${uploadError.message}`);
+      }
+
+      setUploadStatus(`正在確認 ${label} 並更新題組資料...`);
+      return await finalizeUpload(kind, signed.path);
+    }
+
     try {
       setUploading(exam.id);
+      setUploadStatus("");
       setError("");
       setNotice("");
 
-      const data = new FormData();
+      let updatedExam: ExamSet | null = null;
 
-      if (audioFile) data.append("audio", audioFile);
-      if (imageFile) data.append("image", imageFile);
-
-      const response = await fetch(
-        `/api/teacher/exams/${exam.id}/assets`,
-        {
-          method: "POST",
-          body: data,
-        }
-      );
-
-      const raw = await response.text();
-      const body = raw ? JSON.parse(raw) : {};
-
-      if (!response.ok || !body.ok) {
-        throw new Error(body.message || "檔案上傳失敗。");
+      if (audioFile) {
+        updatedExam = await uploadOne("audio", audioFile);
+        setAudioFile(null);
       }
 
-      setNotice("題組檔案已更新。若更換正式 MP3，AI 題目時間軸已自動清除。");
-      setAudioFile(null);
-      setImageFile(null);
+      if (imageFile) {
+        updatedExam = await uploadOne("image", imageFile);
+        setImageFile(null);
+      }
+
+      setUploadStatus("");
+      setNotice(
+        "題組檔案已成功上傳到 Supabase。若更換正式 MP3，AI 題目時間軸已自動清除。"
+      );
+
+      if (updatedExam) {
+        setSelected((current) =>
+          current
+            ? {
+                ...current,
+                ...updatedExam,
+                session_count: current.session_count,
+                graded_count: current.graded_count,
+              }
+            : updatedExam
+        );
+      }
+
       await load();
-      setSelected(body.exam_set);
     } catch (err) {
+      setUploadStatus("");
       setError(err instanceof Error ? err.message : "檔案上傳失敗。");
     } finally {
       setUploading(null);
@@ -394,6 +507,9 @@ export default function TeacherExamsPage() {
                         setSelected(exam);
                         setAudioFile(null);
                         setImageFile(null);
+                        setUploadStatus("");
+                        setError("");
+                        setNotice("");
                       }}
                     >
                       管理題組
@@ -658,6 +774,51 @@ export default function TeacherExamsPage() {
                 </label>
               </section>
 
+              {uploadStatus && (
+                <div style={{
+                  marginBottom: 12,
+                  border: "1px solid #bfdbfe",
+                  borderRadius: 10,
+                  background: "#eff6ff",
+                  color: "#1d4ed8",
+                  padding: "11px 12px",
+                  fontSize: 12,
+                  fontWeight: 800,
+                }}>
+                  {uploadStatus}
+                </div>
+              )}
+
+              {error && (
+                <div style={{
+                  marginBottom: 12,
+                  border: "1px solid #fecaca",
+                  borderRadius: 10,
+                  background: "#fff1f2",
+                  color: "#b91c1c",
+                  padding: "11px 12px",
+                  fontSize: 12,
+                  fontWeight: 800,
+                }}>
+                  {error}
+                </div>
+              )}
+
+              {notice && (
+                <div style={{
+                  marginBottom: 12,
+                  border: "1px solid #bbf7d0",
+                  borderRadius: 10,
+                  background: "#f0fdf4",
+                  color: "#166534",
+                  padding: "11px 12px",
+                  fontSize: 12,
+                  fontWeight: 800,
+                }}>
+                  {notice}
+                </div>
+              )}
+
               <button
                 type="button"
                 disabled={
@@ -667,8 +828,8 @@ export default function TeacherExamsPage() {
                 onClick={() => uploadAssets(selected)}
               >
                 {uploading === selected.id
-                  ? "正在上傳..."
-                  : "儲存題組檔案"}
+                  ? uploadStatus || "正在上傳..."
+                  : "上傳並儲存題組檔案"}
               </button>
             </div>
           </aside>

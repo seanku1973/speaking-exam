@@ -1,15 +1,7 @@
-/* PHASE11_ITEM_LEVEL_GRADES */
-
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import {
-
-  extractResponseText,
-  readOpenAIError,
-  windowText,
-  type Segment,
-} from "@/lib/ai-audio";
-import { ITEM_LEVEL_RUBRIC, normalizeItemLevelGrades } from "@/lib/itemLevelGrades";
+import type { Segment } from "@/lib/ai-audio";
+import { gradeExamItemLevels, gradeExamReport } from "@/lib/examCalibratedGrading";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -18,9 +10,13 @@ function fail(message: string, status = 500) {
   return NextResponse.json({ ok: false, message }, { status });
 }
 
-function clamp20(v: unknown) {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.max(0, Math.min(20, Math.round(n))) : 0;
+function hasMeaningfulItemLevels(json: any) {
+  const g = json?.item_level_grades;
+  if (!g) return false;
+  const levels = [g?.part1?.level, ...(Array.isArray(g?.part2) ? g.part2.map((x:any)=>x?.level) : []), g?.part3?.level]
+    .map(Number)
+    .filter(Number.isFinite);
+  return levels.some((x) => x > 0);
 }
 
 export async function POST(request: NextRequest) {
@@ -31,12 +27,12 @@ export async function POST(request: NextRequest) {
 
   if (!url || !key || !openai) return fail("缺少 Supabase 或 OpenAI 環境變數。");
 
-  const token = (request.headers.get("authorization") || "")
-    .replace(/^Bearer\s+/i, "")
-    .trim();
+  const token = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
   if (!token) return fail("缺少登入憑證。", 401);
 
-  const { sessionId } = await request.json().catch(() => ({ sessionId: "" }));
+  const body = await request.json().catch(() => ({}));
+  const sessionId = String(body?.sessionId || "");
+  const force = body?.force === true;
   if (!sessionId) return fail("缺少 sessionId。", 400);
 
   const supabase = createClient(url, key, {
@@ -47,533 +43,83 @@ export async function POST(request: NextRequest) {
   const { data: auth } = await supabase.auth.getUser(token);
   if (!auth.user) return fail("登入已失效。", 401);
 
-  const { data: result } = await supabase
-    .from("exam_results")
-    .select("blueprint,transcript,student_segments,report_version,total_score,passed")
-    .eq("session_id", sessionId)
-    .maybeSingle();
+  const { data: session } = await supabase.from("exam_sessions").select("id,student_id")
+    .eq("id", sessionId).eq("student_id", auth.user.id).maybeSingle();
+  if (!session) return fail("找不到本次測驗。", 404);
 
-  if (["organized-v5", "organized-v6-exam-calibrated"].includes(String(result?.report_version || ""))) {
-    return NextResponse.json({
-      ok: true,
-      cached: true,
-      result: { total_score: result?.total_score ?? 0, passed: result?.passed ?? false },
-    });
+  const { data: result, error: resultError } = await supabase.from("exam_results").select("*")
+    .eq("session_id", sessionId).maybeSingle();
+  if (resultError || !result) return fail("找不到本次測驗的 AI 資料。", 404);
+
+  const storedTotal = Number(result.total_score ?? 0);
+  const inconsistentZero = storedTotal === 0 && hasMeaningfulItemLevels(result.grading_json);
+  if (!force && result.report_version === "organized-v6-exam-calibrated" && !inconsistentZero) {
+    return NextResponse.json({ ok: true, cached: true, result: { total_score: storedTotal, passed: result.passed ?? false } });
   }
 
-  const blueprint = result?.blueprint;
-  const transcript = String(result?.transcript || "").trim();
-  const segments = Array.isArray(result?.student_segments)
-    ? (result.student_segments as Segment[])
-    : [];
+  const blueprint = result.blueprint;
+  const transcript = String(result.transcript || "").trim();
+  const segments = Array.isArray(result.student_segments) ? (result.student_segments as Segment[]) : [];
 
-  if (!blueprint?.questions || blueprint.questions.length !== 10) {
-    return fail("第 1 階段尚未完成 Q1～Q10 題組時間軸。");
-  }
-  if (!transcript || segments.length === 0) {
-    return fail("第 2 階段尚未完成考生時間軸逐字稿。");
-  }
-
-  await supabase
-    .from("exam_sessions")
-    .update({ status: "grading", grading_status: "step3_q1_q10_grading" })
-    .eq("id", sessionId)
-    .eq("student_id", auth.user.id);
-
-  const readingInput = windowText(
-    segments,
-    blueprint.reading.answer_start,
-    blueprint.reading.answer_end
-  );
-
-  const questionInputs = [...blueprint.questions]
-    .sort((a: any, b: any) => a.question_number - b.question_number)
-    .map((q: any) => ({
-      question_number: q.question_number,
-      question: q.question,
-      ...windowText(segments, q.answer_start, q.answer_end),
-    }));
-
-  const pictureInput = windowText(
-    segments,
-    blueprint.picture.answer_start,
-    blueprint.picture.answer_end
-  );
-
-  const issue = {
-    type: "object",
-    additionalProperties: false,
-    required: ["original", "corrected", "reason"],
-    properties: {
-      original: { type: "string" },
-      corrected: { type: "string" },
-      reason: { type: "string" },
-    },
-  };
-
-  const scoreObject = {
-    type: "object",
-    additionalProperties: false,
-    required: ["score", "feedback"],
-    properties: {
-      score: { type: "integer", minimum: 0, maximum: 20 },
-      feedback: { type: "string" },
-    },
-  };
-
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    required: [
-      "scores",
-      "executive_summary",
-      "reading_review",
-      "question_reviews",
-      "picture_review",
-      "strengths",
-      "priority_improvements",
-      "action_plan",
-    ],
-    properties: {
-      scores: {
-        type: "object",
-        additionalProperties: false,
-        required: ["content", "organization", "grammar", "vocabulary", "fluency"],
-        properties: {
-          content: scoreObject,
-          organization: scoreObject,
-          grammar: scoreObject,
-          vocabulary: scoreObject,
-          fluency: scoreObject,
-        },
-      },
-      executive_summary: { type: "string" },
-      reading_review: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "student_text",
-          "status",
-          "completion_review",
-          "fluency_review",
-          "accuracy_review",
-          "next_step",
-        ],
-        properties: {
-          student_text: { type: "string" },
-          status: {
-            type: "string",
-            enum: ["strong", "adequate", "needs_improvement", "no_response"],
-          },
-          completion_review: { type: "string" },
-          fluency_review: { type: "string" },
-          accuracy_review: { type: "string" },
-          next_step: { type: "string" },
-        },
-      },
-      question_reviews: {
-        type: "array",
-        minItems: 10,
-        maxItems: 10,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: [
-            "question_number",
-            "question",
-            "student_answer",
-            "status",
-            "directness",
-            "content_review",
-            "language_review",
-            "missing_or_expand",
-            "better_answer",
-            "next_step",
-            "language_issues",
-          ],
-          properties: {
-            question_number: { type: "integer", minimum: 1, maximum: 10 },
-            question: { type: "string" },
-            student_answer: { type: "string" },
-            status: {
-              type: "string",
-              enum: ["strong", "adequate", "needs_improvement", "no_response"],
-            },
-            directness: { type: "string" },
-            content_review: { type: "string" },
-            language_review: { type: "string" },
-            missing_or_expand: { type: "string" },
-            better_answer: { type: "string" },
-            next_step: { type: "string" },
-            language_issues: { type: "array", items: issue },
-          },
-        },
-      },
-      picture_review: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "student_answer",
-          "status",
-          "scene_coverage",
-          "organization_review",
-          "language_review",
-          "development_review",
-          "better_description",
-          "next_step",
-        ],
-        properties: {
-          student_answer: { type: "string" },
-          status: {
-            type: "string",
-            enum: ["strong", "adequate", "needs_improvement", "no_response"],
-          },
-          scene_coverage: { type: "string" },
-          organization_review: { type: "string" },
-          language_review: { type: "string" },
-          development_review: { type: "string" },
-          better_description: { type: "string" },
-          next_step: { type: "string" },
-        },
-      },
-      strengths: { type: "array", minItems: 2, maxItems: 5, items: { type: "string" } },
-      priority_improvements: {
-        type: "array",
-        minItems: 2,
-        maxItems: 5,
-        items: { type: "string" },
-      },
-      action_plan: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
-    },
-  };
-
-  const prompt = `
-你是一位重視溝通成功、評分一致且具教學診斷能力的 GEPT 中級口說教師。請用繁體中文製作高度有組織的診斷報告。
-
-硬性規則：
-1. Part 1 Reading = 一個整體檢討。
-2. Part 2 必須 EXACTLY Q1～Q10 十個獨立檢討，不可合併、不可漏題。
-3. Part 3 Picture Description = 一個完整 90 秒看圖敘述，不拆四個引導問題。
-
-每一題 Q1～Q10 都要包含：
-- 正式題目
-- 考生實際回答
-- 是否切題
-- 內容優缺點
-- Grammar / Vocabulary 的具體問題
-- 還能補充什麼（僅作進階練習建議；若原回答已切題，不得把未補充內容當作扣分理由）
-- 一個自然、符合中級程度的英文建議回答
-- 一個本題專屬練習重點
-- 只列考生真的說錯的句子，不可虛構錯誤
-
-不得使用空泛重複的評語。
-
-總分：
-Content / Organization / Grammar / Vocabulary / Fluency 各 0～20。
-總分 >=80 PASS。
-
-【正式模擬測驗評分校準－必須遵守】
-評分要優先看「是否切中題目、是否成功傳達意思」，不可把停頓秒數、開始作答速度或是否把時間用滿當成主要評分依據。
-
-1. 如果考生已經直接回答到問題核心，空白幾秒、思考停頓、較晚開始、回答後留下空白時間，都不得作為扣分理由，也不得寫成缺點。
-2. 如果時間到了或答題時間窗切斷最後一句，且前面已經有完整、切題、可理解的答案：
-   - 不得因最後一句未完成而扣 Content、Organization、Grammar、Vocabulary 或 Fluency。
-   - 不得把被截斷的最後片段列為 grammar error。
-   - 評分時直接忽略該尾端未完成片段。
-3. 如果題目已經被充分回答，不得因「沒有再多說一個例子／原因／細節」而扣分，除非正式題目本身要求那些內容。
-4. 簡短但切題、清楚、可理解的回答可以得到高分；不要把篇幅長短當作分數高低的主要依據。
-5. Fluency 只評估「實際說出的英文」是否順暢可理解；沉默區段、錄音切分、作答時間窗邊界、作答結束後的空白都不計入 Fluency 扣分。
-6. Grammar / Vocabulary 僅在真實語言錯誤影響精確度或理解時扣分。零星小錯但意思清楚，應維持中高分。
-7. Content 若大多數題目都有直接切題回答，應給中高分；不要因回答不夠華麗或不夠長而壓低。
-8. Organization 若回答短但邏輯清楚，仍可高分；不要要求每題都有完整作文式結構。
-9. Part 1 朗讀只評估考生實際朗讀的完成度、可理解度與流暢性；不要把題目印刷文字本身的文法或內容當成考生的語言能力錯誤，也不要因朗讀前後的沉默扣分。
-
-建議校準：
-- 18～20：表現強，任務大多清楚完成；允許少量不影響理解的小錯。
-- 16～17：穩定達標，多數回答切題可理解，有一些語言限制。
-- 13～15：基本可溝通，但多題有明顯內容不足或語言問題。
-- 0～12：多數任務未完成、偏題、無有效回答，或語言問題嚴重影響理解。
-
-READING:
-${JSON.stringify(readingInput)}
-
-Q1-Q10:
-${JSON.stringify(questionInputs)}
-
-PICTURE DESCRIPTION:
-${JSON.stringify(pictureInput)}
-
-FULL TRANSCRIPT:
-${transcript}
-`;
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${openai}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "speaking_exam_organized_v6_calibrated",
-          strict: true,
-          schema,
-        },
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    return fail(`OpenAI 評分失敗：${await readOpenAIError(response)}`);
-  }
-
-  const payload = await response.json();
-  const text = extractResponseText(payload);
-  if (!text) return fail("OpenAI 評分完成，但沒有回傳內容。");
-
-  let report: any;
   try {
-    report = JSON.parse(text);
-  } catch {
-    return fail("OpenAI 評分 JSON 解析失敗。");
-  }
+    await supabase.from("exam_sessions").update({ status: "grading", grading_status: force ? "regrading_current_policy" : "step3_q1_q10_grading", updated_at: new Date().toISOString() })
+      .eq("id", sessionId).eq("student_id", auth.user.id);
 
-  if (!Array.isArray(report.question_reviews) || report.question_reviews.length !== 10) {
-    return fail(`Q1～Q10 報告不完整，目前只有 ${report.question_reviews?.length ?? 0} 題。`);
-  }
-
-  report.question_reviews.sort((a: any, b: any) => a.question_number - b.question_number);
-  for (let i = 1; i <= 10; i++) {
-    if (report.question_reviews[i - 1]?.question_number !== i) {
-      return fail(`逐題報告缺少 Question ${i}。`);
+    let graded = await gradeExamReport({ openai, model, blueprint, transcript, segments });
+    let itemLevels: any = null;
+    try {
+      itemLevels = await gradeExamItemLevels({ openai, model, transcript, itemFeedback: graded.report.question_reviews, gradingJson: graded.gradingJson });
+    } catch (itemError) {
+      console.error("Item-level grading failed:", itemError);
     }
-  }
 
-  const content = clamp20(report.scores.content.score);
-  const organization = clamp20(report.scores.organization.score);
-  const grammar = clamp20(report.scores.grammar.score);
-  const vocabulary = clamp20(report.scores.vocabulary.score);
-  const fluency = clamp20(report.scores.fluency.score);
-  const total = content + organization + grammar + vocabulary + fluency;
-  const passed = total >= 80;
+    const meaningfulLevels = itemLevels && [itemLevels.part1, ...(itemLevels.part2 || []), itemLevels.part3].some((x:any)=>Number(x?.level)>0);
+    if (graded.total === 0 && meaningfulLevels) {
+      console.warn("Detected inconsistent 0/100 with non-zero item levels; retrying 100-point grading once.");
+      graded = await gradeExamReport({ openai, model, blueprint, transcript, segments });
+      if (graded.total === 0) {
+        throw new Error("100 分制評分與逐題 0～5 級結果不一致；系統已阻止寫入異常的 0 分。請重新評分一次。");
+      }
+    }
 
-  const gradingJson = {
-    report_version: "organized-v6-exam-calibrated",
-    grading_policy_version: "exam-calibrated-phase14",
-    executive_summary: report.executive_summary,
-    scores: {
-      content: { score: content, feedback: report.scores.content.feedback },
-      organization: {
-        score: organization,
-        feedback: report.scores.organization.feedback,
-      },
-      grammar: { score: grammar, feedback: report.scores.grammar.feedback },
-      vocabulary: {
-        score: vocabulary,
-        feedback: report.scores.vocabulary.feedback,
-      },
-      fluency: { score: fluency, feedback: report.scores.fluency.feedback },
-    },
-    reading_review: report.reading_review,
-    question_reviews: report.question_reviews,
-    picture_review: report.picture_review,
-    strengths: report.strengths,
-    priority_improvements: report.priority_improvements,
-    action_plan: report.action_plan,
-  };
+    const previousHistory = Array.isArray(result.grading_json?.regrade_history) ? [...result.grading_json.regrade_history] : [];
+    if (force || inconsistentZero) {
+      previousHistory.push({ total_score: result.total_score ?? null, content_score: result.content_score ?? null, organization_score: result.organization_score ?? null, grammar_score: result.grammar_score ?? null, vocabulary_score: result.vocabulary_score ?? null, fluency_score: result.fluency_score ?? null, report_version: result.report_version || null, saved_at: new Date().toISOString() });
+    }
 
-  const { error: saveError } = await supabase
-    .from("exam_results")
-    .update({
-      content_score: content,
-      organization_score: organization,
-      grammar_score: grammar,
-      vocabulary_score: vocabulary,
-      fluency_score: fluency,
-      total_score: total,
-      passed,
-      feedback: report.executive_summary,
-      strengths: report.strengths.join("\n"),
-      weaknesses: report.priority_improvements.join("\n"),
-      item_feedback: report.question_reviews,
+    const gradingJson = {
+      ...graded.gradingJson,
+      ...(itemLevels ? { item_level_grades: itemLevels, item_level_grades_version: "exam-calibrated-phase14b" } : {}),
+      regrade_history: previousHistory.slice(-10),
+      repaired_inconsistent_zero: inconsistentZero || undefined,
+    };
+
+    const { error: saveError } = await supabase.from("exam_results").update({
+      content_score: graded.content,
+      organization_score: graded.organization,
+      grammar_score: graded.grammar,
+      vocabulary_score: graded.vocabulary,
+      fluency_score: graded.fluency,
+      total_score: graded.total,
+      passed: graded.passed,
+      feedback: graded.report.executive_summary,
+      strengths: graded.report.strengths.join("\n"),
+      weaknesses: graded.report.priority_improvements.join("\n"),
+      item_feedback: graded.report.question_reviews,
       grading_json: gradingJson,
       openai_model: model,
       report_version: "organized-v6-exam-calibrated",
       graded_at: new Date().toISOString(),
-    })
-    .eq("session_id", sessionId);
+    }).eq("session_id", sessionId);
+    if (saveError) throw new Error(`評分完成但儲存失敗：${saveError.message}`);
 
-  if (saveError) return fail(`評分完成但儲存失敗：${saveError.message}`);
+    await supabase.from("exam_sessions").update({ status: "completed", grading_status: "completed", total_score: graded.total, updated_at: new Date().toISOString() })
+      .eq("id", sessionId).eq("student_id", auth.user.id);
 
-  await supabase
-    .from("exam_sessions")
-    .update({
-      status: "completed",
-      grading_status: "completed",
-      total_score: total,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", sessionId)
-    .eq("student_id", auth.user.id);
-
-  
-  /* PHASE11_ITEM_LEVEL_GRADES */
-  try {
-    const phase11SessionId = sessionId;
-
-    const { data: phase11Existing } = await supabase
-      .from("exam_results")
-      .select("transcript,grading_json,item_feedback")
-      .eq("session_id", phase11SessionId)
-      .maybeSingle();
-
-    const phase11Transcript =
-      typeof phase11Existing?.transcript === "string"
-        ? phase11Existing.transcript
-        : "";
-
-    const phase11ExistingJson =
-      phase11Existing?.grading_json && typeof phase11Existing.grading_json === "object"
-        ? phase11Existing.grading_json
-        : {};
-
-    const phase11ApiKey = process.env.OPENAI_API_KEY;
-
-    if (phase11ApiKey && phase11Transcript) {
-      const phase11Response = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${phase11ApiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: process.env.OPENAI_GRADING_MODEL || "gpt-5.6-luna",
-          input: [
-            {
-              role: "system",
-              content:
-                "You are grading a formal English speaking mock exam. Apply a communicative-success-first calibration. " +
-                ITEM_LEVEL_RUBRIC +
-                "\nReturn only JSON that matches the schema. " +
-                "Use integer levels 0-5 only. " +
-                "Never penalize pauses, unused time, late starts, or a trailing sentence cut off by the answer-time boundary after the core question has already been answered. " +
-                "Do not infer unsupported pronunciation details."
-            },
-            {
-              role: "user",
-              content:
-                "Assign the 12 item-level grades for this completed speaking test.\n\n" +
-                "TRANSCRIPT:\n" +
-                phase11Transcript +
-                "\n\nEXISTING ITEM FEEDBACK:\n" +
-                JSON.stringify(phase11Existing?.item_feedback ?? {}) +
-                "\n\nEXISTING GRADING JSON:\n" +
-                JSON.stringify(phase11ExistingJson)
-            }
-          ],
-          text: {
-            format: {
-              type: "json_schema",
-              name: "speaking_item_level_grades",
-              strict: true,
-              schema: {
-                type: "object",
-                additionalProperties: false,
-                required: ["part1", "part2", "part3"],
-                properties: {
-                  part1: {
-                    type: "object",
-                    additionalProperties: false,
-                    required: ["key", "label", "level", "rationale"],
-                    properties: {
-                      key: { type: "string", const: "part1" },
-                      label: { type: "string" },
-                      level: { type: "integer", minimum: 0, maximum: 5 },
-                      rationale: { type: "string" }
-                    }
-                  },
-                  part2: {
-                    type: "array",
-                    minItems: 10,
-                    maxItems: 10,
-                    items: {
-                      type: "object",
-                      additionalProperties: false,
-                      required: ["key", "label", "level", "rationale"],
-                      properties: {
-                        key: { type: "string" },
-                        label: { type: "string" },
-                        level: { type: "integer", minimum: 0, maximum: 5 },
-                        rationale: { type: "string" }
-                      }
-                    }
-                  },
-                  part3: {
-                    type: "object",
-                    additionalProperties: false,
-                    required: ["key", "label", "level", "rationale"],
-                    properties: {
-                      key: { type: "string", const: "part3" },
-                      label: { type: "string" },
-                      level: { type: "integer", minimum: 0, maximum: 5 },
-                      rationale: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        })
-      });
-
-      if (phase11Response.ok) {
-        const phase11Raw = await phase11Response.json();
-
-        const phase11Text =
-          phase11Raw?.output_text ||
-          phase11Raw?.output
-            ?.flatMap((o: any) => o?.content || [])
-            ?.map((c: any) => c?.text || "")
-            ?.join("") ||
-          "";
-
-        if (phase11Text) {
-          const phase11Parsed = normalizeItemLevelGrades(
-            JSON.parse(phase11Text)
-          );
-
-          if (phase11Parsed) {
-            await supabase
-              .from("exam_results")
-              .update({
-                grading_json: {
-                  ...phase11ExistingJson,
-                  item_level_grades: phase11Parsed,
-                  item_level_grades_version: "phase14-calibrated-v1"
-                }
-              })
-              .eq("session_id", phase11SessionId);
-          }
-        }
-      } else {
-        console.error(
-          "Phase 11 item-level grading failed:",
-          phase11Response.status,
-          await phase11Response.text()
-        );
-      }
-    }
-  } catch (phase11Error) {
-    // Never break the existing 100-point result.
-    console.error("Phase 11 item-level grading error:", phase11Error);
+    return NextResponse.json({ ok: true, cached: false, repaired: inconsistentZero, result: { total_score: graded.total, passed: graded.passed } });
+  } catch (error) {
+    await supabase.from("exam_sessions").update({ status: "completed", grading_status: "grading_failed", updated_at: new Date().toISOString() })
+      .eq("id", sessionId).eq("student_id", auth.user.id);
+    return fail(error instanceof Error ? error.message : "評分失敗。");
   }
-
-return NextResponse.json({
-    ok: true,
-    result: { total_score: total, passed },
-  });
 }

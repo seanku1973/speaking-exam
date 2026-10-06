@@ -1,8 +1,11 @@
+/* PHASE12_CLASS_SCORE_MATRIX */
+/* PHASE11C_DISPLAY_AND_BACKFILL */
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import styles from "./page.module.css";
+import ExamMatrix from "./ExamMatrix";
 
 type Row = {
   session_id: string;
@@ -43,6 +46,19 @@ type QuestionReview = {
   language_issues: LanguageIssue[];
 };
 
+type ItemLevelGrade = {
+  key?: string;
+  label?: string;
+  level?: number;
+  rationale?: string;
+};
+
+type ItemLevelGradeBundle = {
+  part1?: ItemLevelGrade;
+  part2?: ItemLevelGrade[];
+  part3?: ItemLevelGrade;
+};
+
 type Detail = {
   session: any;
   result: any;
@@ -60,7 +76,7 @@ type Detail = {
 };
 
 type ViewMode = "scored" | "pending" | "all";
-type DetailTab = "overview" | "questions" | "picture" | "transcript" | "history";
+type DetailTab = "overview" | "reading" | "questions" | "picture" | "transcript" | "history";
 
 function fmtDate(value?: string | null) {
   if (!value) return "—";
@@ -124,6 +140,96 @@ function questionStatus(status?: string) {
   return { label: "未充分作答", tone: "bad" };
 }
 
+
+function normalizeLevel(value: unknown) {
+  const level = Number(value);
+  if (!Number.isFinite(level)) return null;
+  return Math.max(0, Math.min(5, Math.round(level)));
+}
+
+function itemLevelStyle(level: number | null) {
+  if (level === null) {
+    return {
+      background: "#f8fafc",
+      border: "1px solid #e2e8f0",
+      color: "#94a3b8",
+    };
+  }
+
+  if (level >= 4) {
+    return {
+      background: "#ecfdf5",
+      border: "1px solid #bbf7d0",
+      color: "#166534",
+    };
+  }
+
+  if (level === 3) {
+    return {
+      background: "#fffbeb",
+      border: "1px solid #fde68a",
+      color: "#92400e",
+    };
+  }
+
+  return {
+    background: "#fff1f2",
+    border: "1px solid #fecaca",
+    color: "#b91c1c",
+  };
+}
+
+function ItemLevelBadge({
+  level,
+  label,
+  compact = false,
+}: {
+  level: unknown;
+  label?: string;
+  compact?: boolean;
+}) {
+  const normalized = normalizeLevel(level);
+  const tone = itemLevelStyle(normalized);
+
+  return (
+    <div
+      style={{
+        ...tone,
+        minWidth: compact ? 54 : 72,
+        minHeight: compact ? 34 : 48,
+        borderRadius: 10,
+        padding: compact ? "6px 9px" : "8px 12px",
+        display: "inline-flex",
+        alignItems: "baseline",
+        justifyContent: "center",
+        gap: 3,
+        fontWeight: 900,
+        whiteSpace: "nowrap",
+      }}
+      aria-label={`${label || "題目"}等級 ${
+        normalized === null ? "尚未評定" : `${normalized} / 5`
+      }`}
+    >
+      {label && !compact && (
+        <span
+          style={{
+            marginRight: 5,
+            fontSize: 11,
+            fontWeight: 800,
+            opacity: 0.8,
+          }}
+        >
+          {label}
+        </span>
+      )}
+      <strong style={{ fontSize: compact ? 15 : 20, lineHeight: 1 }}>
+        {normalized === null ? "—" : normalized}
+      </strong>
+      <small style={{ fontSize: compact ? 9 : 10, fontWeight: 800 }}>/ 5</small>
+    </div>
+  );
+}
+
 export default function TeacherProgressPage() {
   const router = useRouter();
 
@@ -144,8 +250,11 @@ export default function TeacherProgressPage() {
   const [detailError, setDetailError] = useState("");
   const [detailTab, setDetailTab] = useState<DetailTab>("overview");
   const [activeQuestion, setActiveQuestion] = useState(1);
+  const [itemGradeLoading, setItemGradeLoading] = useState(false);
+  const [itemGradeMessage, setItemGradeMessage] = useState("");
   const [regradeLoading, setRegradeLoading] = useState(false);
   const [regradeMessage, setRegradeMessage] = useState("");
+  const [matrixOpen, setMatrixOpen] = useState(false);
 
   async function loadDashboard() {
     try {
@@ -194,6 +303,7 @@ export default function TeacherProgressPage() {
       setDetailLoading(true);
       setDetailTab("overview");
       setActiveQuestion(1);
+      setRegradeMessage("");
 
       const response = await fetch(`/api/teacher/session/${sessionId}`, {
         cache: "no-store",
@@ -227,23 +337,101 @@ export default function TeacherProgressPage() {
     }
   }
 
+  async function generateItemGrades() {
+    if (!selectedId) return;
+
+    try {
+      setItemGradeLoading(true);
+      setItemGradeMessage("");
+
+      const response = await fetch(
+        `/api/teacher/session/${selectedId}/item-grades`,
+        { method: "POST" }
+      );
+
+      if (response.status === 401) {
+        router.replace("/teacher-login");
+        return;
+      }
+
+      const raw = await response.text();
+      let body: any = {};
+
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(
+          `逐題等級 API 回傳格式錯誤（HTTP ${response.status}）。`
+        );
+      }
+
+      if (!response.ok || !body.ok) {
+        throw new Error(body.message || "無法產生逐題 0～5 級成績。");
+      }
+
+      setItemGradeMessage("逐題 0～5 級成績已完成。");
+      await openDetail(selectedId);
+    } catch (err) {
+      setItemGradeMessage(
+        err instanceof Error ? err.message : "逐題等級評定失敗。"
+      );
+    } finally {
+      setItemGradeLoading(false);
+    }
+  }
+
   async function regradeSelectedResult() {
     if (!selectedId || regradeLoading) return;
-    if (!window.confirm("將使用既有逐字稿與錄音分段，依目前較寬鬆的評分標準重新評分。\n\n不需要學生重新錄音。是否繼續？")) return;
+
+    if (
+      !window.confirm(
+        "將使用既有 Transcript、AI 報告與錄音分段（若有），依目前較寬鬆的標準重新評分。\n\n原本的 Q1～Q10 逐題 0～5 級會保留，不需要學生重新錄音。是否繼續？"
+      )
+    ) {
+      return;
+    }
+
     try {
       setRegradeLoading(true);
       setRegradeMessage("");
-      const response = await fetch(`/api/teacher/session/${selectedId}/regrade`, { method: "POST" });
+
+      const response = await fetch(
+        `/api/teacher/session/${selectedId}/regrade`,
+        { method: "POST" }
+      );
+
+      if (response.status === 401) {
+        router.replace("/teacher-login");
+        return;
+      }
+
       const raw = await response.text();
-      let body:any = {};
-      try { body = raw ? JSON.parse(raw) : {}; } catch { throw new Error(`重新評分 API 回傳格式錯誤（HTTP ${response.status}）。`); }
-      if (!response.ok || !body.ok) throw new Error(body.message || "老師重新評分失敗。");
-      setRegradeMessage(`重新評分完成：${body.previous_score ?? "—"} → ${body.total_score ?? "—"} 分`);
-      await openDetail(selectedId);
+      let body: any = {};
+
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(
+          `重新評分 API 回傳格式錯誤（HTTP ${response.status}）。`
+        );
+      }
+
+      if (!response.ok || !body.ok) {
+        throw new Error(body.message || "老師重新評分失敗。");
+      }
+
+      setRegradeMessage(
+        `重新評分完成：${body.previous_score ?? "—"} → ${body.total_score ?? "—"} 分。逐題 0～5 級已保留。`
+      );
       await loadDashboard();
+      await openDetail(selectedId);
     } catch (err) {
-      setRegradeMessage(err instanceof Error ? err.message : "老師重新評分失敗。");
-    } finally { setRegradeLoading(false); }
+      setRegradeMessage(
+        err instanceof Error ? err.message : "老師重新評分失敗。"
+      );
+    } finally {
+      setRegradeLoading(false);
+    }
   }
 
   async function logout() {
@@ -406,6 +594,28 @@ export default function TeacherProgressPage() {
   }
 
   const report = detail?.result?.grading_json || {};
+  const itemLevelGrades: ItemLevelGradeBundle =
+    report?.item_level_grades || {};
+
+  const readingGrade = itemLevelGrades?.part1 || null;
+  const pictureGrade = itemLevelGrades?.part3 || null;
+
+  function getQuestionGrade(questionNumber: number) {
+    const part2 = Array.isArray(itemLevelGrades?.part2)
+      ? itemLevelGrades.part2
+      : [];
+
+    const key = `q${questionNumber}`;
+
+    return (
+      part2.find(
+        (item) => String(item?.key || "").toLowerCase() === key
+      ) ||
+      part2[questionNumber - 1] ||
+      null
+    );
+  }
+
 
   const questions = useMemo(() => {
     const source = Array.isArray(report?.question_reviews)
@@ -446,6 +656,13 @@ export default function TeacherProgressPage() {
           </div>
 
           <div className={styles.headerActions}>
+            <button
+              type="button"
+              className={styles.secondaryButton}
+              onClick={() => setMatrixOpen(true)}
+            >
+              全班答題表
+            </button>
             <button
               type="button"
               className={styles.secondaryButton}
@@ -714,6 +931,15 @@ export default function TeacherProgressPage() {
         </section>
       </div>
 
+      <ExamMatrix
+        open={matrixOpen}
+        onClose={() => setMatrixOpen(false)}
+        onOpenReport={(sessionId) => {
+          setMatrixOpen(false);
+          openDetail(sessionId);
+        }}
+      />
+
       {selectedId && (
         <div
           className={styles.overlay}
@@ -812,6 +1038,7 @@ export default function TeacherProgressPage() {
                 <div className={styles.drawerTabs}>
                   {[
                     ["overview", "總覽"],
+                    ["reading", "朗讀"],
                     ["questions", "Q1～Q10"],
                     ["picture", "看圖敘述"],
                     ["transcript", "Transcript"],
@@ -838,15 +1065,26 @@ export default function TeacherProgressPage() {
                       <section className={styles.reportCard}>
                         <div className={styles.reportCardHeader}>
                           <div>
-                            <span className={styles.sectionKicker}>RE-GRADE</span>
+                            <span className={styles.sectionKicker}>
+                              RE-GRADE
+                            </span>
                             <h3>依目前標準重新評分</h3>
                           </div>
-                          <button type="button" onClick={regradeSelectedResult} disabled={regradeLoading} className={styles.primaryButton}>
+                          <button
+                            type="button"
+                            onClick={regradeSelectedResult}
+                            disabled={regradeLoading}
+                            className={styles.primaryButton}
+                          >
                             {regradeLoading ? "重新評分中..." : "重新評分"}
                           </button>
                         </div>
-                        <p className={styles.longText}>直接使用既有逐字稿與錄音分段，不需要學生重新錄音。可用來修復 100 分制顯示 0 分但逐題 0～5 級正常的異常紀錄。</p>
-                        {regradeMessage && <p className={styles.longText}>{regradeMessage}</p>}
+                        <p className={styles.longText}>
+                          直接使用既有 Transcript、原 AI 報告與錄音分段（若有）重新計算 100 分制。原本的朗讀、Q1～Q10、看圖 0～5 級不會被刪除，也不需要學生重新錄音。
+                        </p>
+                        {regradeMessage && (
+                          <p className={styles.longText}>{regradeMessage}</p>
+                        )}
                       </section>
 
                       {detail.recording_url && (
@@ -925,6 +1163,103 @@ export default function TeacherProgressPage() {
                             <div className={styles.reportCardHeader}>
                               <div>
                                 <span className={styles.sectionKicker}>
+                                  ITEM LEVEL GRADES
+                                </span>
+                                <h3>逐題成績（0～5 級）</h3>
+                              </div>
+                            </div>
+
+                            <div
+                              style={{
+                                display: "grid",
+                                gridTemplateColumns:
+                                  "repeat(auto-fit, minmax(92px, 1fr))",
+                                gap: 8,
+                              }}
+                            >
+                              <ItemLevelBadge
+                                label="朗讀"
+                                level={readingGrade?.level}
+                              />
+
+                              {Array.from({ length: 10 }, (_, index) => {
+                                const grade = getQuestionGrade(index + 1);
+                                return (
+                                  <ItemLevelBadge
+                                    key={`overview-q${index + 1}`}
+                                    label={`Q${index + 1}`}
+                                    level={grade?.level}
+                                  />
+                                );
+                              })}
+
+                              <ItemLevelBadge
+                                label="看圖"
+                                level={pictureGrade?.level}
+                              />
+                            </div>
+
+                            {!report?.item_level_grades && (
+                              <div
+                                style={{
+                                  marginTop: 14,
+                                  padding: 14,
+                                  borderRadius: 12,
+                                  border: "1px solid #bfdbfe",
+                                  background: "#eff6ff",
+                                }}
+                              >
+                                <p
+                                  className={styles.longText}
+                                  style={{ margin: 0 }}
+                                >
+                                  此筆測驗尚未產生逐題 0～5 級成績。舊測驗不需要重新錄音，可直接使用既有 Transcript 與 AI 報告補評。
+                                </p>
+
+                                <button
+                                  type="button"
+                                  onClick={generateItemGrades}
+                                  disabled={itemGradeLoading}
+                                  style={{
+                                    marginTop: 10,
+                                    minHeight: 38,
+                                    border: 0,
+                                    borderRadius: 9,
+                                    padding: "0 14px",
+                                    background: "#2563eb",
+                                    color: "white",
+                                    fontWeight: 900,
+                                    cursor: itemGradeLoading
+                                      ? "not-allowed"
+                                      : "pointer",
+                                    opacity: itemGradeLoading ? 0.6 : 1,
+                                  }}
+                                >
+                                  {itemGradeLoading
+                                    ? "正在產生逐題等級..."
+                                    : "產生這筆測驗的 0～5 級成績"}
+                                </button>
+
+                                {itemGradeMessage && (
+                                  <p
+                                    style={{
+                                      margin: "9px 0 0",
+                                      color: "#475569",
+                                      fontSize: 11,
+                                      fontWeight: 700,
+                                    }}
+                                  >
+                                    {itemGradeMessage}
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </section>
+
+                          <section className={styles.reportCard}>
+                            <div className={styles.reportCardHeader}>
+                              <div>
+                                <span className={styles.sectionKicker}>
                                   DIAGNOSIS
                                 </span>
                                 <h3>總體診斷</h3>
@@ -989,6 +1324,38 @@ export default function TeacherProgressPage() {
                     </div>
                   )}
 
+                  {detailTab === "reading" && (
+                    <div className={styles.reportSections}>
+                      <section className={styles.reportCard}>
+                        <div className={styles.reportCardHeader}>
+                          <div>
+                            <span className={styles.sectionKicker}>
+                              PART 1 · READING ALOUD
+                            </span>
+                            <h3>第一部分｜朗讀</h3>
+                          </div>
+
+                          <ItemLevelBadge level={readingGrade?.level} />
+                        </div>
+
+                        <div className={styles.studentAnswerCard}>
+                          <span>ITEM GRADE</span>
+                          <p>
+                            第一部分以整段朗讀表現作為一個完整項目評分，不將文章內容拆成個別題目。
+                          </p>
+                        </div>
+
+                        <div className={styles.practiceFocus}>
+                          <span>0～5 級評分理由</span>
+                          <p>
+                            {readingGrade?.rationale ||
+                              "此筆結果尚未產生第一部分 0～5 級評分。"}
+                          </p>
+                        </div>
+                      </section>
+                    </div>
+                  )}
+
                   {detailTab === "questions" && (
                     <div className={styles.questionWorkspace}>
                       {questions.length === 0 ? (
@@ -1021,11 +1388,27 @@ export default function TeacherProgressPage() {
                                   }
                                 >
                                   <span>Q{q.question_number}</span>
-                                  <i
-                                    className={`${styles.statusDot} ${
-                                      styles[status.tone]
-                                    }`}
-                                  />
+                                  <span
+                                    style={{
+                                      marginLeft: "auto",
+                                      display: "inline-flex",
+                                      alignItems: "center",
+                                      gap: 6,
+                                    }}
+                                  >
+                                    <ItemLevelBadge
+                                      compact
+                                      level={
+                                        getQuestionGrade(q.question_number)
+                                          ?.level
+                                      }
+                                    />
+                                    <i
+                                      className={`${styles.statusDot} ${
+                                        styles[status.tone]
+                                      }`}
+                                    />
+                                  </span>
                                 </button>
                               );
                             })}
@@ -1041,21 +1424,39 @@ export default function TeacherProgressPage() {
                                   <h3>{selectedQuestion.question}</h3>
                                 </div>
 
-                                <span
-                                  className={`${styles.questionStatusBadge} ${
-                                    styles[
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 8,
+                                    flexWrap: "wrap",
+                                    justifyContent: "flex-end",
+                                  }}
+                                >
+                                  <ItemLevelBadge
+                                    level={
+                                      getQuestionGrade(
+                                        selectedQuestion.question_number
+                                      )?.level
+                                    }
+                                  />
+
+                                  <span
+                                    className={`${styles.questionStatusBadge} ${
+                                      styles[
+                                        questionStatus(
+                                          selectedQuestion.status
+                                        ).tone
+                                      ]
+                                    }`}
+                                  >
+                                    {
                                       questionStatus(
                                         selectedQuestion.status
-                                      ).tone
-                                    ]
-                                  }`}
-                                >
-                                  {
-                                    questionStatus(
-                                      selectedQuestion.status
-                                    ).label
-                                  }
-                                </span>
+                                      ).label
+                                    }
+                                  </span>
+                                </div>
                               </div>
 
                               <div className={styles.studentAnswerCard}>
@@ -1063,6 +1464,16 @@ export default function TeacherProgressPage() {
                                 <p>
                                   {selectedQuestion.student_answer ||
                                     "（沒有偵測到有效回答）"}
+                                </p>
+                              </div>
+
+                              <div className={styles.practiceFocus}>
+                                <span>本題 0～5 級評分理由</span>
+                                <p>
+                                  {getQuestionGrade(
+                                    selectedQuestion.question_number
+                                  )?.rationale ||
+                                    "此筆結果尚未產生本題的 0～5 級評分理由。"}
                                 </p>
                               </div>
 
@@ -1161,6 +1572,8 @@ export default function TeacherProgressPage() {
                             </span>
                             <h3>第三部分｜看圖敘述</h3>
                           </div>
+
+                          <ItemLevelBadge level={pictureGrade?.level} />
                         </div>
 
                         <div className={styles.studentAnswerCard}>
@@ -1170,6 +1583,14 @@ export default function TeacherProgressPage() {
                               "（沒有偵測到有效回答）"}
                           </p>
                         </div>
+                      </section>
+
+                      <section className={styles.practiceFocus}>
+                        <span>看圖敘述 0～5 級評分理由</span>
+                        <p>
+                          {pictureGrade?.rationale ||
+                            "此筆結果尚未產生第三部分 0～5 級評分理由。"}
+                        </p>
                       </section>
 
                       <section className={styles.pictureGrid}>

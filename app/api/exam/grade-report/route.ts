@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import type { Segment } from "@/lib/ai-audio";
-import { gradeExamItemLevels, gradeExamReport } from "@/lib/examCalibratedGrading";
+import { gradeExamItemLevels, gradeExamReport, rescoreExamFromExistingEvidence } from "@/lib/examCalibratedGrading";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -74,11 +74,21 @@ export async function POST(request: NextRequest) {
     }
 
     const meaningfulLevels = itemLevels && [itemLevels.part1, ...(itemLevels.part2 || []), itemLevels.part3].some((x:any)=>Number(x?.level)>0);
+    let fallbackScore: Awaited<ReturnType<typeof rescoreExamFromExistingEvidence>> | null = null;
+
     if (graded.total === 0 && meaningfulLevels) {
-      console.warn("Detected inconsistent 0/100 with non-zero item levels; retrying 100-point grading once.");
-      graded = await gradeExamReport({ openai, model, blueprint, transcript, segments });
-      if (graded.total === 0) {
-        throw new Error("100 分制評分與逐題 0～5 級結果不一致；系統已阻止寫入異常的 0 分。請重新評分一次。");
+      console.warn("Detected inconsistent 0/100 with non-zero item levels; using evidence-based rescore.");
+      fallbackScore = await rescoreExamFromExistingEvidence({
+        openai,
+        model,
+        transcript,
+        gradingJson: graded.gradingJson,
+        itemFeedback: graded.report.question_reviews,
+        itemLevelGrades: itemLevels,
+      });
+
+      if (fallbackScore.total === 0) {
+        throw new Error("100 分制評分與逐題 0～5 級結果仍不一致；系統已阻止寫入異常的 0 分。");
       }
     }
 
@@ -87,24 +97,68 @@ export async function POST(request: NextRequest) {
       previousHistory.push({ total_score: result.total_score ?? null, content_score: result.content_score ?? null, organization_score: result.organization_score ?? null, grammar_score: result.grammar_score ?? null, vocabulary_score: result.vocabulary_score ?? null, fluency_score: result.fluency_score ?? null, report_version: result.report_version || null, saved_at: new Date().toISOString() });
     }
 
+    const effective = fallbackScore
+      ? {
+          content: fallbackScore.content,
+          organization: fallbackScore.organization,
+          grammar: fallbackScore.grammar,
+          vocabulary: fallbackScore.vocabulary,
+          fluency: fallbackScore.fluency,
+          total: fallbackScore.total,
+          passed: fallbackScore.passed,
+          executiveSummary: fallbackScore.executiveSummary,
+          strengths: fallbackScore.strengths,
+          priorityImprovements: fallbackScore.priorityImprovements,
+          actionPlan: fallbackScore.actionPlan,
+        }
+      : {
+          content: graded.content,
+          organization: graded.organization,
+          grammar: graded.grammar,
+          vocabulary: graded.vocabulary,
+          fluency: graded.fluency,
+          total: graded.total,
+          passed: graded.passed,
+          executiveSummary: graded.report.executive_summary,
+          strengths: graded.report.strengths,
+          priorityImprovements: graded.report.priority_improvements,
+          actionPlan: graded.report.action_plan,
+        };
+
     const gradingJson = {
       ...graded.gradingJson,
+      ...(fallbackScore
+        ? {
+            scores: {
+              content: { ...(graded.gradingJson?.scores?.content || {}), score: effective.content },
+              organization: { ...(graded.gradingJson?.scores?.organization || {}), score: effective.organization },
+              grammar: { ...(graded.gradingJson?.scores?.grammar || {}), score: effective.grammar },
+              vocabulary: { ...(graded.gradingJson?.scores?.vocabulary || {}), score: effective.vocabulary },
+              fluency: { ...(graded.gradingJson?.scores?.fluency || {}), score: effective.fluency },
+            },
+            executive_summary: effective.executiveSummary,
+            strengths: effective.strengths,
+            priority_improvements: effective.priorityImprovements,
+            action_plan: effective.actionPlan,
+            score_repaired_from_item_level_consistency: true,
+          }
+        : {}),
       ...(itemLevels ? { item_level_grades: itemLevels, item_level_grades_version: "exam-calibrated-phase14b" } : {}),
       regrade_history: previousHistory.slice(-10),
       repaired_inconsistent_zero: inconsistentZero || undefined,
     };
 
     const { error: saveError } = await supabase.from("exam_results").update({
-      content_score: graded.content,
-      organization_score: graded.organization,
-      grammar_score: graded.grammar,
-      vocabulary_score: graded.vocabulary,
-      fluency_score: graded.fluency,
-      total_score: graded.total,
-      passed: graded.passed,
-      feedback: graded.report.executive_summary,
-      strengths: graded.report.strengths.join("\n"),
-      weaknesses: graded.report.priority_improvements.join("\n"),
+      content_score: effective.content,
+      organization_score: effective.organization,
+      grammar_score: effective.grammar,
+      vocabulary_score: effective.vocabulary,
+      fluency_score: effective.fluency,
+      total_score: effective.total,
+      passed: effective.passed,
+      feedback: effective.executiveSummary,
+      strengths: effective.strengths.join("\n"),
+      weaknesses: effective.priorityImprovements.join("\n"),
       item_feedback: graded.report.question_reviews,
       grading_json: gradingJson,
       openai_model: model,
@@ -113,10 +167,10 @@ export async function POST(request: NextRequest) {
     }).eq("session_id", sessionId);
     if (saveError) throw new Error(`評分完成但儲存失敗：${saveError.message}`);
 
-    await supabase.from("exam_sessions").update({ status: "completed", grading_status: "completed", total_score: graded.total, updated_at: new Date().toISOString() })
+    await supabase.from("exam_sessions").update({ status: "completed", grading_status: "completed", total_score: effective.total, updated_at: new Date().toISOString() })
       .eq("id", sessionId).eq("student_id", auth.user.id);
 
-    return NextResponse.json({ ok: true, cached: false, repaired: inconsistentZero, result: { total_score: graded.total, passed: graded.passed } });
+    return NextResponse.json({ ok: true, cached: false, repaired: inconsistentZero, result: { total_score: effective.total, passed: effective.passed } });
   } catch (error) {
     await supabase.from("exam_sessions").update({ status: "completed", grading_status: "grading_failed", updated_at: new Date().toISOString() })
       .eq("id", sessionId).eq("student_id", auth.user.id);

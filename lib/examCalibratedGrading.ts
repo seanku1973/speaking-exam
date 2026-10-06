@@ -477,3 +477,157 @@ export async function gradeExamItemLevels(args: {
   if (!parsed) throw new Error("逐題評分資料不完整。");
   return parsed;
 }
+
+export async function rescoreExamFromExistingEvidence(args: {
+  openai: string;
+  model: string;
+  transcript: string;
+  gradingJson: any;
+  itemFeedback: any;
+  itemLevelGrades?: any;
+}) {
+  const { openai, model, transcript, gradingJson, itemFeedback, itemLevelGrades } = args;
+
+  if (!transcript.trim()) {
+    throw new Error("這筆測驗沒有 Transcript，因此無法重新評分。");
+  }
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "scores",
+      "executive_summary",
+      "strengths",
+      "priority_improvements",
+      "action_plan",
+    ],
+    properties: {
+      scores: {
+        type: "object",
+        additionalProperties: false,
+        required: ["content", "organization", "grammar", "vocabulary", "fluency"],
+        properties: {
+          content: { type: "integer", minimum: 0, maximum: 20 },
+          organization: { type: "integer", minimum: 0, maximum: 20 },
+          grammar: { type: "integer", minimum: 0, maximum: 20 },
+          vocabulary: { type: "integer", minimum: 0, maximum: 20 },
+          fluency: { type: "integer", minimum: 0, maximum: 20 },
+        },
+      },
+      executive_summary: { type: "string" },
+      strengths: {
+        type: "array",
+        minItems: 2,
+        maxItems: 5,
+        items: { type: "string" },
+      },
+      priority_improvements: {
+        type: "array",
+        minItems: 2,
+        maxItems: 5,
+        items: { type: "string" },
+      },
+      action_plan: {
+        type: "array",
+        minItems: 3,
+        maxItems: 6,
+        items: { type: "string" },
+      },
+    },
+  };
+
+  const prompt = `
+你正在重新校準一份已完成的 GEPT 中級口說模擬測驗。
+
+請只重新計算 5 個 0～20 分的能力分數與總體診斷。不要刪除或重寫原本 Q1～Q10 的逐題 0～5 級。
+
+【必須遵守】
+1. 評分優先看是否切題、是否成功傳達意思。
+2. 幾秒停頓、思考空白、較晚開始、未把時間用滿，不得扣分。
+3. 若時間到導致最後一句被截斷，但前面已回答題目核心，忽略該尾端片段，不得因此扣 Content / Organization / Grammar / Vocabulary / Fluency。
+4. 題目沒有要求額外理由或例子時，不得因答案簡短而扣分。
+5. 簡短但切題、清楚、可理解的答案可以拿高分。
+6. 零星 grammar / vocabulary 小錯，只要不影響理解，不應造成大幅扣分。
+7. Fluency 只評實際說出的英文，不評空白時間。
+8. Part 1 是朗讀表現，不把題目原文內容當作學生自己產出的語言。
+
+建議校準：
+18～20：表現強，任務大多清楚完成；允許少量不影響理解的小錯。
+16～17：穩定達標，多數回答切題可理解。
+13～15：基本可溝通，但多題有明顯限制。
+0～12：多數題未完成、偏題、無有效回答，或嚴重影響理解。
+
+如果既有逐題 0～5 級顯示多數題為 3～5 級，就不得無理由給出 0/100 或接近 0 的總體分數。逐題等級是交叉檢查證據，不是機械換算公式。
+
+FULL TRANSCRIPT:
+${transcript}
+
+EXISTING GRADING JSON:
+${JSON.stringify(gradingJson ?? {})}
+
+EXISTING ITEM FEEDBACK:
+${JSON.stringify(itemFeedback ?? {})}
+
+EXISTING ITEM LEVEL GRADES:
+${JSON.stringify(itemLevelGrades ?? {})}
+`;
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openai}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "speaking_exam_rescore_existing_evidence",
+          strict: true,
+          schema,
+        },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI 重新評分失敗：${await readOpenAIError(response)}`);
+  }
+
+  const payload = await response.json();
+  const text = extractResponseText(payload);
+  if (!text) throw new Error("OpenAI 重新評分完成，但沒有回傳內容。");
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("OpenAI 重新評分 JSON 解析失敗。");
+  }
+
+  const content = clamp20(parsed.scores?.content);
+  const organization = clamp20(parsed.scores?.organization);
+  const grammar = clamp20(parsed.scores?.grammar);
+  const vocabulary = clamp20(parsed.scores?.vocabulary);
+  const fluency = clamp20(parsed.scores?.fluency);
+  const total = content + organization + grammar + vocabulary + fluency;
+
+  return {
+    content,
+    organization,
+    grammar,
+    vocabulary,
+    fluency,
+    total,
+    passed: total >= 80,
+    executiveSummary: String(parsed.executive_summary || ""),
+    strengths: Array.isArray(parsed.strengths) ? parsed.strengths : [],
+    priorityImprovements: Array.isArray(parsed.priority_improvements)
+      ? parsed.priority_improvements
+      : [],
+    actionPlan: Array.isArray(parsed.action_plan) ? parsed.action_plan : [],
+  };
+}

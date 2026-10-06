@@ -53,11 +53,11 @@ export async function POST(request: NextRequest) {
     .eq("session_id", sessionId)
     .maybeSingle();
 
-  if (result?.report_version === "organized-v5") {
+  if (["organized-v5", "organized-v6-exam-calibrated"].includes(String(result?.report_version || ""))) {
     return NextResponse.json({
       ok: true,
       cached: true,
-      result: { total_score: result.total_score, passed: result.passed },
+      result: { total_score: result?.total_score ?? 0, passed: result?.passed ?? false },
     });
   }
 
@@ -248,7 +248,7 @@ export async function POST(request: NextRequest) {
   };
 
   const prompt = `
-你是一位嚴謹的 GEPT 中級口說教師。請用繁體中文製作高度有組織的診斷報告。
+你是一位重視溝通成功、評分一致且具教學診斷能力的 GEPT 中級口說教師。請用繁體中文製作高度有組織的診斷報告。
 
 硬性規則：
 1. Part 1 Reading = 一個整體檢討。
@@ -261,7 +261,7 @@ export async function POST(request: NextRequest) {
 - 是否切題
 - 內容優缺點
 - Grammar / Vocabulary 的具體問題
-- 還能補充什麼
+- 還能補充什麼（僅作進階練習建議；若原回答已切題，不得把未補充內容當作扣分理由）
 - 一個自然、符合中級程度的英文建議回答
 - 一個本題專屬練習重點
 - 只列考生真的說錯的句子，不可虛構錯誤
@@ -271,6 +271,28 @@ export async function POST(request: NextRequest) {
 總分：
 Content / Organization / Grammar / Vocabulary / Fluency 各 0～20。
 總分 >=80 PASS。
+
+【正式模擬測驗評分校準－必須遵守】
+評分要優先看「是否切中題目、是否成功傳達意思」，不可把停頓秒數、開始作答速度或是否把時間用滿當成主要評分依據。
+
+1. 如果考生已經直接回答到問題核心，空白幾秒、思考停頓、較晚開始、回答後留下空白時間，都不得作為扣分理由，也不得寫成缺點。
+2. 如果時間到了或答題時間窗切斷最後一句，且前面已經有完整、切題、可理解的答案：
+   - 不得因最後一句未完成而扣 Content、Organization、Grammar、Vocabulary 或 Fluency。
+   - 不得把被截斷的最後片段列為 grammar error。
+   - 評分時直接忽略該尾端未完成片段。
+3. 如果題目已經被充分回答，不得因「沒有再多說一個例子／原因／細節」而扣分，除非正式題目本身要求那些內容。
+4. 簡短但切題、清楚、可理解的回答可以得到高分；不要把篇幅長短當作分數高低的主要依據。
+5. Fluency 只評估「實際說出的英文」是否順暢可理解；沉默區段、錄音切分、作答時間窗邊界、作答結束後的空白都不計入 Fluency 扣分。
+6. Grammar / Vocabulary 僅在真實語言錯誤影響精確度或理解時扣分。零星小錯但意思清楚，應維持中高分。
+7. Content 若大多數題目都有直接切題回答，應給中高分；不要因回答不夠華麗或不夠長而壓低。
+8. Organization 若回答短但邏輯清楚，仍可高分；不要要求每題都有完整作文式結構。
+9. Part 1 朗讀只評估考生實際朗讀的完成度、可理解度與流暢性；不要把題目印刷文字本身的文法或內容當成考生的語言能力錯誤，也不要因朗讀前後的沉默扣分。
+
+建議校準：
+- 18～20：表現強，任務大多清楚完成；允許少量不影響理解的小錯。
+- 16～17：穩定達標，多數回答切題可理解，有一些語言限制。
+- 13～15：基本可溝通，但多題有明顯內容不足或語言問題。
+- 0～12：多數任務未完成、偏題、無有效回答，或語言問題嚴重影響理解。
 
 READING:
 ${JSON.stringify(readingInput)}
@@ -297,7 +319,7 @@ ${transcript}
       text: {
         format: {
           type: "json_schema",
-          name: "speaking_exam_organized_v5",
+          name: "speaking_exam_organized_v6_calibrated",
           strict: true,
           schema,
         },
@@ -340,7 +362,8 @@ ${transcript}
   const passed = total >= 80;
 
   const gradingJson = {
-    report_version: "organized-v5",
+    report_version: "organized-v6-exam-calibrated",
+    grading_policy_version: "exam-calibrated-phase14",
     executive_summary: report.executive_summary,
     scores: {
       content: { score: content, feedback: report.scores.content.feedback },
@@ -379,7 +402,7 @@ ${transcript}
       item_feedback: report.question_reviews,
       grading_json: gradingJson,
       openai_model: model,
-      report_version: "organized-v5",
+      report_version: "organized-v6-exam-calibrated",
       graded_at: new Date().toISOString(),
     })
     .eq("session_id", sessionId);
@@ -433,10 +456,11 @@ ${transcript}
             {
               role: "system",
               content:
-                "You are grading an English speaking test. " +
+                "You are grading a formal English speaking mock exam. Apply a communicative-success-first calibration. " +
                 ITEM_LEVEL_RUBRIC +
                 "\nReturn only JSON that matches the schema. " +
                 "Use integer levels 0-5 only. " +
+                "Never penalize pauses, unused time, late starts, or a trailing sentence cut off by the answer-time boundary after the core question has already been answered. " +
                 "Do not infer unsupported pronunciation details."
             },
             {
@@ -529,7 +553,7 @@ ${transcript}
                 grading_json: {
                   ...phase11ExistingJson,
                   item_level_grades: phase11Parsed,
-                  item_level_grades_version: "phase11-v1"
+                  item_level_grades_version: "phase14-calibrated-v1"
                 }
               })
               .eq("session_id", phase11SessionId);

@@ -46,8 +46,8 @@ export default function ProgressPage() {
           .maybeSingle(),
       ]);
 
-      if (!examResult || examResult.report_version !== "organized-v5") {
-        setError("organized-v5 逐題報告尚未完成。");
+      if (!examResult || !["organized-v5", "organized-v6-exam-calibrated"].includes(String(examResult.report_version || ""))) {
+        setError("逐題報告尚未完成。");
         setLoading(false);
         return;
       }

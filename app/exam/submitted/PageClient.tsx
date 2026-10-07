@@ -110,7 +110,7 @@ export default function SubmittedPage() {
         .eq("session_id", sessionId)
         .maybeSingle();
 
-      if (["organized-v5", "organized-v6-exam-calibrated"].includes(String(result?.report_version || ""))) {
+      if (["organized-v5", "organized-v6-exam-calibrated", "organized-v7-weighted-item-level"].includes(String(result?.report_version || ""))) {
         setStates(["done", "done", "done"]);
         setScore(Number(result?.total_score ?? 0));
         return;

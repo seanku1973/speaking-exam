@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import styles from "./page.module.css";
 import ExamMatrix from "./ExamMatrix";
+import { calculateWeightedExamScore } from "@/lib/examWeightedScore";
 
 type Row = {
   session_id: string;
@@ -421,7 +422,7 @@ export default function TeacherProgressPage() {
       }
 
       setRegradeMessage(
-        `重新評分完成：${body.previous_score ?? "—"} → ${body.total_score ?? "—"} 分。逐題 0～5 級已保留。`
+        `重新計分完成：${body.previous_score ?? "—"} → ${body.total_score ?? "—"} 分。總分已改用第一部分 20%＋第二部分 30%＋第三部分 50%。`
       );
       await loadDashboard();
       await openDetail(selectedId);
@@ -599,6 +600,7 @@ export default function TeacherProgressPage() {
 
   const readingGrade = itemLevelGrades?.part1 || null;
   const pictureGrade = itemLevelGrades?.part3 || null;
+  const weightedScore = calculateWeightedExamScore(itemLevelGrades);
 
   function getQuestionGrade(questionNumber: number) {
     const part2 = Array.isArray(itemLevelGrades?.part2)
@@ -1076,7 +1078,7 @@ export default function TeacherProgressPage() {
                             disabled={regradeLoading}
                             className={styles.primaryButton}
                           >
-                            {regradeLoading ? "重新評分中..." : "重新評分"}
+                            {regradeLoading ? "重新計分中..." : "依三部分權重重新計分"}
                           </button>
                         </div>
                         <p className={styles.longText}>
@@ -1120,43 +1122,38 @@ export default function TeacherProgressPage() {
                             <div className={styles.reportCardHeader}>
                               <div>
                                 <span className={styles.sectionKicker}>
-                                  SCORE PROFILE
+                                  WEIGHTED SCORE
                                 </span>
-                                <h3>五項能力</h3>
+                                <h3>三部分加權計分</h3>
                               </div>
                             </div>
 
-                            <div className={styles.categoryGrid}>
-                              {[
-                                ["Content", detail.result.content_score],
-                                [
-                                  "Organization",
-                                  detail.result.organization_score,
-                                ],
-                                ["Grammar", detail.result.grammar_score],
-                                [
-                                  "Vocabulary",
-                                  detail.result.vocabulary_score,
-                                ],
-                                ["Fluency", detail.result.fluency_score],
-                              ].map(([label, raw]) => {
-                                const score = Number(raw ?? 0);
-                                return (
-                                  <div
-                                    key={String(label)}
-                                    className={`${styles.categoryScore} ${
-                                      score >= 16
-                                        ? styles.categoryPass
-                                        : styles.categoryFail
-                                    }`}
-                                  >
-                                    <span>{label}</span>
-                                    <strong>{score}</strong>
-                                    <small>/20</small>
+                            {weightedScore ? (
+                              <>
+                                <div className={styles.categoryGrid}>
+                                  <div className={`${styles.categoryScore} ${styles.categoryPass}`}>
+                                    <span>第一部分 20%</span>
+                                    <strong>{weightedScore.part1Level}</strong>
+                                    <small>/5 → {weightedScore.part1Points} 分</small>
                                   </div>
-                                );
-                              })}
-                            </div>
+                                  <div className={`${styles.categoryScore} ${styles.categoryPass}`}>
+                                    <span>第二部分 30%</span>
+                                    <strong>{weightedScore.part2Average}</strong>
+                                    <small>/5 平均 → {weightedScore.part2Points} 分</small>
+                                  </div>
+                                  <div className={`${styles.categoryScore} ${styles.categoryPass}`}>
+                                    <span>第三部分 50%</span>
+                                    <strong>{weightedScore.part3Level}</strong>
+                                    <small>/5 → {weightedScore.part3Points} 分</small>
+                                  </div>
+                                </div>
+                                <p className={styles.longText} style={{ marginTop: 14 }}>
+                                  總分 = (第一部分 × 0.2 + 第二部分平均 × 0.3 + 第三部分 × 0.5) × 20 = {weightedScore.total} / 100
+                                </p>
+                              </>
+                            ) : (
+                              <p className={styles.longText}>尚未取得完整逐題 0～5 級，無法計算加權總分。</p>
+                            )}
                           </section>
 
                           <section className={styles.reportCard}>

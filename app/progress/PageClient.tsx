@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import { calculateWeightedExamScore } from "@/lib/examWeightedScore";
 
 export default function ProgressPage() {
   const router = useRouter();
@@ -46,7 +47,7 @@ export default function ProgressPage() {
           .maybeSingle(),
       ]);
 
-      if (!examResult || !["organized-v5", "organized-v6-exam-calibrated"].includes(String(examResult.report_version || ""))) {
+      if (!examResult || !["organized-v5", "organized-v6-exam-calibrated", "organized-v7-weighted-item-level"].includes(String(examResult.report_version || ""))) {
         setError("逐題報告尚未完成。");
         setLoading(false);
         return;
@@ -70,9 +71,10 @@ export default function ProgressPage() {
 
   const total = Number(result.total_score || 0);
   const passed = total >= 80;
-  const scores = result.grading_json?.scores || {};
   const reading = result.grading_json?.reading_review || {};
   const picture = result.grading_json?.picture_review || {};
+  const itemLevelGrades = result.grading_json?.item_level_grades || {};
+  const weightedScore = calculateWeightedExamScore(itemLevelGrades);
 
   return (
     <main className="min-h-screen bg-slate-100 px-4 py-10">
@@ -97,35 +99,36 @@ export default function ProgressPage() {
         </section>
 
         <section className="rounded-2xl bg-white p-7 shadow-sm">
-          <h2 className="text-2xl font-black">二、五項能力分析</h2>
-          <div className="mt-5 grid gap-4 md:grid-cols-5">
-            {[
-              ["Content", result.content_score, scores.content?.feedback],
-              ["Organization", result.organization_score, scores.organization?.feedback],
-              ["Grammar", result.grammar_score, scores.grammar?.feedback],
-              ["Vocabulary", result.vocabulary_score, scores.vocabulary?.feedback],
-              ["Fluency", result.fluency_score, scores.fluency?.feedback],
-            ].map(([name, value]: any) => (
-              <div key={name} className="rounded-xl border p-4 text-center">
-                <p className="font-bold text-slate-500">{name}</p>
-                <p className="mt-2 text-3xl font-black">{value}/20</p>
+          <h2 className="text-2xl font-black">二、三部分加權計分</h2>
+          {weightedScore ? (
+            <>
+              <div className="mt-5 grid gap-4 md:grid-cols-3">
+                <div className="rounded-xl border p-5 text-center">
+                  <p className="font-bold text-slate-500">第一部分｜朗讀 20%</p>
+                  <p className="mt-2 text-3xl font-black">{weightedScore.part1Level}/5</p>
+                  <p className="mt-2 text-sm text-slate-600">換算 {weightedScore.part1Points} 分</p>
+                </div>
+                <div className="rounded-xl border p-5 text-center">
+                  <p className="font-bold text-slate-500">第二部分｜Q1～Q10 30%</p>
+                  <p className="mt-2 text-3xl font-black">{weightedScore.part2Average}/5</p>
+                  <p className="mt-2 text-sm text-slate-600">10 題平均，換算 {weightedScore.part2Points} 分</p>
+                </div>
+                <div className="rounded-xl border p-5 text-center">
+                  <p className="font-bold text-slate-500">第三部分｜看圖敘述 50%</p>
+                  <p className="mt-2 text-3xl font-black">{weightedScore.part3Level}/5</p>
+                  <p className="mt-2 text-sm text-slate-600">換算 {weightedScore.part3Points} 分</p>
+                </div>
               </div>
-            ))}
-          </div>
-          <div className="mt-6 grid gap-4 md:grid-cols-2">
-            {[
-              ["Content", scores.content?.feedback],
-              ["Organization", scores.organization?.feedback],
-              ["Grammar", scores.grammar?.feedback],
-              ["Vocabulary", scores.vocabulary?.feedback],
-              ["Fluency", scores.fluency?.feedback],
-            ].map(([name, feedback]) => (
-              <div key={name} className="rounded-xl border p-5">
-                <p className="font-black">{name}</p>
-                <p className="mt-2 leading-7 text-slate-700">{feedback || "—"}</p>
+              <div className="mt-5 rounded-xl bg-blue-50 p-5 text-blue-950">
+                <p className="font-black">計分公式</p>
+                <p className="mt-2 leading-7">
+                  (第一部分 × 0.2 + 第二部分平均 × 0.3 + 第三部分 × 0.5) × 20 = {weightedScore.total} / 100
+                </p>
               </div>
-            ))}
-          </div>
+            </>
+          ) : (
+            <p className="mt-4 text-slate-600">尚未取得完整逐題 0～5 級，無法計算加權總分。</p>
+          )}
         </section>
 
         <section className="rounded-2xl bg-white p-7 shadow-sm">
